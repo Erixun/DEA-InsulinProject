@@ -1,0 +1,50 @@
+---
+title: "Clinical"
+output: html_notebook
+---
+
+Libraries used
+```{r}
+library(ggplot2)
+library(ggpubr)
+library(edgeR)
+```
+
+
+Load clinical data and view the table
+```{r}
+#Load clinical data into global environment
+load("/Users/eriksundberg/Desktop/Data4Analysis-selected/clinical_data_2018_04_06.RData")
+
+#View the clinical data table
+view(clinical)
+```
+
+
+Construct barplot for gender groups
+```{r}
+Gndr <- droplevels(clinical[,7])
+summary(Gndr)
+#Result of summary(Gndr) used to produce df and a barplot
+df <- data.frame(gdr = c("Kvinnor", "Män"), nr = c(137, 14))
+ggbarplot(df, "gdr", "nr", xlab = " ", ylab = "Antal")
+```
+
+
+Construct dataframe with mean+-sd of age per condition
+```{r}
+NO_Ages <- clinical[c(1:5, 7:8, 10:33, 6, 9, 14, 27), "Age"]
+OB_Ages <- clinical[c(35,37,39,41,43,45,47,49,51,53,55,57,59,61,63,65,67,69,71,73,75,77,79,81,83,85,87,89,91,93,95,97,99,101,103,105,107,109,111,113,115,117,119,121,123,125,127,129,131,133,135,137,139,141,143,145,147,149,151)-1, 8]
+POB_Ages <- clinical[c(35,37,39,41,43,45,47,49,51,53,55,57,59,61,63,65,67,69,71,73,75,77,79,81,83,85,87,89,91,93,95,97,99,101,103,105,107,109,111,113,115,117,119,121,123,125,127,129,131,133,135,137,139,141,143,145,147,149,151),8]
+
+Ag <- data.frame(Group = c("NO", "OB", "POB"), Age = c(mean(NO_Ages), mean(OB_Ages), mean(POB_Ages)), sd = c(sd(NO_Ages), sd(OB_Ages), sd(POB_Ages)))
+```
+
+
+Plot the barplot
+```{r}
+ggplot(Ag, aes(x=Group, y=Age)) +
+  +     geom_bar(position=position_dodge(), stat="identity", colour='blue') +
+  +     geom_errorbar(aes(ymin=Age-sd, ymax=Age+sd), width=.2,position=position_dodge(.9))
+```
+

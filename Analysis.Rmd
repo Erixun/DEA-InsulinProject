@@ -1,0 +1,469 @@
+---
+title: "Analysis"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+(Dependant on script in Expression.Rmd)
+####**Libraries used**
+This chunk loads libraries used for filtering and analysis, and runs a script upon which the rest of the code is dependent.
+```{r message=FALSE}
+#call all libraries
+library(knitr) 
+library(GSEABase)
+library(clusterProfiler)
+library(cluster)
+library(org.Hs.eg.db)
+library(ggrepel)
+library(DOSE)
+library(enrichplot)
+library(ggfortify)
+library(grid)
+library(gridExtra)
+#Run Expression.Rmd script
+knit('Expression.Rmd', quiet = T) 
+```
+
+
+####**Remove POB subjects from table of counts, cpm and cohort**
+The chunk below removes all data on post-obese subjects as they will not be a part of the differential expression analysis performed further down.
+```{r}
+#Removing columns w POB subjects from the tables
+ix4 <- which(colnames(CpmTblB) %in% c(POB.f0,POB.h0))
+CpmTblC <- CpmTblB[, -ix4]
+Counts3 <- Counts2[, -ix4]
+
+#Removing rows w POB subjects from the cohort
+ix5 <- which(rownames(cohort.female) %in% rownames(cohort.female[cohort.female$Type == "POB",]))
+cohort.female2 <- cohort.female[-ix5,]
+```
+
+
+####**Open subsets textfile and extract subset of interest**
+In this chunk a subset (#94) w 26 obese (OB) subjects are extracted from a set of 100 randomised subsets based on the entire group of OB subjects.
+```{r}
+#Open table w 100 randomised subsets of OB subjects
+subset <- read.table('subset.txt',header=F,sep='\t')
+#Extract subset 94 as a vector
+S94 <- subset[100,2:27]
+S94 <- as.matrix(S94)
+S94 <- c(S94)
+#Make new cohort w subjects from S94
+S94.OB <- cohort.female2[cohort.female2$Patnr %in% S94,]
+cohort.NO <- cohort.female2[cohort.female2$Type == 'NO',]
+#Create subject-groups based on f/hi state
+S94.OBf <- S94.OB[S94.OB$newcond == 'OB.f0',]$colnames
+S94.OBh <- S94.OB[S94.OB$newcond == 'OB.h0',]$colnames
+#Create table of counts w all NO and S94 subjects
+S94Counts <- Counts3[, c(NO.f0,NO.h0,S94.OBf,S94.OBh)]
+S94Counts_TPM <- cpm(Counts3[, c(NO.f0,NO.h0,S94.OBf,S94.OBh)])
+```
+
+
+####**Make DGElists with groups and normalize**
+Below the subjects corresponding conditions are gathered into one vector, in order to group them accordingly, following that indices for genes are extracted from an annotation-file in order to construct a DGEList which is then normalised.
+```{r}
+#Collect all condition-groups into one vector
+S94Groups <- S94.OB$newcond
+NOGroups <- cohort.female2[cohort.female2$Type == 'NO',]$newcond
+NOS94 <- c(NOGroups, S94Groups)
+NOS94 <- factor(NOS94)
+
+#Pick out TC indices corresponding to rows in annotation-file
+load('AnnotationFile_allTC.Rdata')
+mTC <- match(rownames(S94Counts), annotation$TC)
+#Create DGEList for use in DE analysis
+y <- DGEList(counts = S94Counts, group = NOS94, genes = annotation[mTC,'gene'])#annotation$gene[annoTC])#[annoTC,'gene'])
+y_TPM <- DGEList(counts = S94Counts_TPM, group = NOS94, genes = annotation[mTC,]$gene)
+
+#Normalise w relative log expression method
+Counts_RLE <- calcNormFactors(y, method = "RLE")
+TPM_RLE <- calcNormFactors(y_TPM, method = "RLE")
+```
+
+
+####**DE analysis step 1**
+This chunk constructs a design matrix for fitting the data to a generalised linear model, and gives an estimation of the dispersion of the normalised counts data.
+```{r}
+#Create design-matrix
+design <- model.matrix(~0+NOS94, data = Counts_RLE$samples)
+colnames(design) <- levels(y$samples$group)
+
+#Estimate dispersion
+y <- estimateDisp(Counts_RLE, design) 
+y$common.dispersion
+```
+
+
+####**DE analysis step 2**
+This chunk fits a generalized log-linear model to the counts data for expression of TC, then a matrix of chosen contrasts is created, and tag-wise statistical tests conducted.
+```{r}
+#Fit a quasi-likelihood negative binomial generalized log-linear model to count data
+fit <- glmQLFit(y, design)
+
+#Make contrasts for use in statistical testing
+con <- makeContrasts(OBfvsNOf=OB.f0-NO.f0, OBhvsNOh=OB.h0-NO.h0, levels=design)
+
+#Conduct genewise statistical tests for the contrast.
+f.OBNO <- glmQLFTest(fit, contrast=con[,"OBfvsNOf"])
+h.OBNO <- glmQLFTest(fit, contrast=con[,"OBhvsNOh"])
+```
+
+
+####**Add column of matched Entrez IDs to dataframe w gene symbols**
+In this chunk entrez gene IDs are matched with gene symbols and added to the gene element of each DGEList.
+```{r}
+egSYMBOL2EG <- toTable(org.Hs.egSYMBOL2EG)
+m <- match(y$genes$genes, egSYMBOL2EG$symbol)
+y$genes$EZgene_id <- egSYMBOL2EG$gene_id[m]
+f.OBNO$genes$EZgene_id <- egSYMBOL2EG$gene_id[m]
+h.OBNO$genes$EZgene_id <- egSYMBOL2EG$gene_id[m]
+```
+
+
+####**Make tables and df for plots**
+In the chunk below tables and dataframes are constructed for use in visualising differentially expressed TC in plots.
+```{r}
+#Create tables of top DE genes/tags for volcanoplots
+fTop1 <- topTags(f.OBNO, adjust.method = 'BH', n = nrow(f.OBNO))
+fOBtop <- fTop1$table[fTop1$table$FDR<0.01,]
+hTop1 <- topTags(h.OBNO, adjust.method = 'BH', n = nrow(h.OBNO))
+hOBtop <- hTop1$table[hTop1$table$FDR<0.01,]
+
+#Create df w results from test for up- and down-regulated genes/TC
+sOBf <- data.frame(summary(decideTests(f.OBNO, p.value = 0.01, adjust.method = 'fdr')))
+sOBh <- data.frame(summary(decideTests(h.OBNO, p.value = 0.01,adjust.method = 'fdr')))
+
+#Create df for barplot
+df.bp <- data.frame(sOBf, sOBh)
+df.val <- df.bp[,c("Var1","Freq","Freq.1")]
+mdf.val <- melt(df.val)
+mdf.sig <- mdf.val[c(1,3,4,6),]
+mdf.sig[,2] <- c("OB.f\n(vs NO.f)","OB.f\n(vs NO.f)","OB.h\n(vs NO.h)","OB.h\n(vs NO.h)")
+```
+
+
+####**Barplot for DE-genes**
+This chunk gives a visualisation of the values for significantly up- or down-regulated TC with a barplot.
+```{r}
+#Barplot for DE-genes
+gbp <- ggbarplot(mdf.sig, x = "Var1", xlab = "", y = "value", facet.by = "variable", ylab = "Nr of TC", title = "Differential expression of TC", xaxp = 0, label = T, lab.pos = "in", fill = "Var1") + theme(plot.title = element_text(color = "blue", face = "bold", hjust = 0.5), axis.ticks.x = element_line(color = "white"), axis.title.y = element_text(color = "black", face = "plain"), axis.text.x = element_text(color = "white"))
+ggpar(gbp, legend = "right", legend.title = "")
+```
+
+
+####**Visualize correlations w PCAplot**
+In this chunk a principle component analysis is performed. This helps us find correlations between the expressions of different tag clusters. Results obtained are then visualised in a PCA plot made with ggplot.
+```{r}
+#Construct df from TPM matrix, and do PCA w prcomp
+S94Counts_TPM2 <- data.frame(S94Counts_TPM)
+df_pca <- prcomp(t(S94Counts_TPM2),center = TRUE,scale=TRUE)
+#head(df_pca$x)
+df_out <- as.data.frame(df_pca$x)
+Rn <- rownames(df_out)
+#Add percentages to PC columns
+percentage <- round(df_pca$sdev / sum(df_pca$sdev) * 100, 2)
+percentage <- paste(colnames(df_out), sep = " ", paste("(", as.character(percentage), "%", ")", sep = ""))
+#Add a column w rownames 
+df_out <- cbind(Rn, df_out)
+df_c <- rbind(cohort.NO, S94.OB)
+df_c <- data.frame(df_c$colnames, df_c$newcond, df_c$Type, df_c$Time)
+names(df_c) <- c("Patcond", "Groupcond", "Group", "State")
+#Merge the df's by equal columns Rn and Patcond
+prcM <- merge(df_out, df_c, by.x = "Rn", by.y = "Patcond")
+
+#Visualise PCA results in a PCA plot
+pcgp <- ggplot(prcM, aes(y = PC2, x = PC1, color = Groupcond)) + xlab(percentage[1]) + ylab(percentage[2])
+pcgp <- pcgp + geom_point(data = prcM, aes(fill = Groupcond), size = 3, shape = 21, stroke = 0.05) + theme(axis.line = element_line(color = "black"), legend.position = "right", legend.background = element_rect(color = "white"), legend.title = element_blank(), axis.title = element_text(face = "bold"))
+pcgp <- pcgp + theme(panel.background = element_rect(fill = "white"), panel.border = element_rect(fill = NA))
+pcgp <- pcgp + stat_ellipse() + geom_point(shape = 21, size = 3, color = "black", data = prcM, aes(fill = Groupcond), stroke = 0.3, show.legend = FALSE)
+pcgp
+
+#Make barplot illustrating difference between groups according to PCA
+pcbp <- ggplot(prcM, aes(y = PC1, x = Groupcond, color = Groupcond)) + geom_boxplot()
+pcbp
+```
+
+
+####**Perform GO and KEGG enrichment analyses**
+This chunk perform enrichment analyses for gene ontologies (GO) and for KEGG pathways. GO enrichment analyses are made with enrichGO from the clusterProfiler package. In this case it gives us the top enriched categories of GO involving biological processes (BP). In performing the KEGG analysis we use enrichKEGG from clusterProfiler. This gives us the top KEGG pathways for which our chosen tag clusters are enriched. Results from the analyses are then visualised in goplots and barplots.
+```{r}
+#Perform GO enrichment analyses
+ego1 <- enrichGO(fOBtop$EZgene_id, ont = "BP", OrgDb = org.Hs.eg.db, pvalueCutoff = 0.01, readable = T)
+ego2 <- enrichGO(hOBtop$EZgene_id, ont = "BP", OrgDb = org.Hs.eg.db, pvalueCutoff = 0.01, readable = T)
+#Visualise w goplots
+gp1 <- goplot(ego1, showCategory = 10)
+emapplot(ego1, showCategory = 20) + border()
+#gp1
+gp2 <- goplot(ego2, showCategory = 10)
+emapplot(ego2, showCategory = 20)
+#gp2
+#Visualise w barplots
+gbp1 <- barplot(ego1, showCategory=10)
+gbp1
+gbp2 <- barplot(ego2, showCategory=10)
+gbp2
+
+#Perform KEGG enrichment analyses
+genSf <- bitr_kegg(fOBtop$EZgene_id, fromType='kegg', toType='uniprot', organism='hsa', drop = T)
+genSh <- bitr_kegg(hOBtop$EZgene_id, fromType='kegg', toType='uniprot', organism='hsa', drop = T)
+
+ekeg1 <- enrichKEGG(genSf[,2], 
+                    organism = 'hsa', 
+                    pvalueCutoff = 0.05,
+                    keyType = 'uniprot')
+
+ekeg1 <- setReadable(ekeg1, OrgDb = 'org.Hs.eg.db', keyType = "UNIPROT")
+ekeg2 <- enrichKEGG(genSh[,2], 
+                    organism = 'hsa', 
+                    pvalueCutoff = 0.001,
+                    keyType = 'uniprot')
+ekeg2 <- setReadable(ekeg2, OrgDb = 'org.Hs.eg.db', keyType = "UNIPROT")
+#Visualise w barplots
+kbp1 <- barplot(ekeg1, showCategory = 10)
+kbp1
+kbp2 <- barplot(ekeg2, showCategory = 10)
+kbp2
+```
+
+
+####**Volcanoplot fOB - fNO**
+In this chunk we construct df for use in volcano plot to visualise differentially expressed tag clusters, and highlight specific genes, with subjects in a fasting state.
+```{r}
+#Construct df for volcanoplot
+vpfdf <- data.frame(log10FC = fTop1$table$logFC,
+                 log10FDR = -log10(fTop1$table$FDR),
+                 genes = fTop1$table$genes,
+                 lcpm = fTop1$table$logCPM)
+
+#Make df w only significant data (FDR < 0.01)
+vpf.df <- data.frame(log10FC = fOBtop$logFC,
+                 log10FDR = -log10(fOBtop$FDR),
+                 genes = fOBtop$genes,
+                 lcpm = fOBtop$logCPM)
+rownames(vpf.df) <- rownames(fOBtop)
+
+#Make df w fOBdown w logFC < -1, fOBup w logFC > 1
+f.ix1 <- which(fOBtop$logFC < -1)
+fOBdown <- fOBtop[f.ix1,]
+rownames(fOBdown) <- rownames(fOBtop[f.ix1,])
+vpf.df1 <- data.frame(log10FC = fOBdown$logFC,
+                 log10FDR = -log10(fOBdown$FDR),
+                 genes = fOBdown$genes,
+                 lcpm = fOBdown$logCPM)
+rownames(vpf.df1) <- rownames(fOBdown)
+f.ix2 <- which(fOBtop$logFC > 1)
+fOBup <- fOBtop[f.ix2,]
+rownames(fOBup) <- rownames(fOBtop[f.ix2,])
+vpf.df2 <- data.frame(log10FC = fOBup$logFC,
+                 log10FDR = -log10(fOBup$FDR),
+                 genes = fOBup$genes,
+                 lcpm = fOBup$logCPM)
+rownames(vpf.df2) <- rownames(fOBup)
+vpf.df12 <- rbind(vpf.df1, vpf.df2)
+#Pick out indices for rows/genes of interest
+#genes associated w mordbid obesity:
+gif <- c("PLIN1","LIPE","PPARG","CEP19","GHR","IGF1","IGF2","LEP","LEPR","UCP2","LPL","FTO","ADIPOR1","ADIPOQ")
+gif.ix <- which(vpf.df12$genes %in% gif)
+rgif <- rownames(vpf.df12[gif.ix,])
+
+h <- c("ADIPOR1","ADIPOQ")
+a <- c("PLIN1","FABP4","LIPE")
+hsl <- which(fOBtop$genes %in% h)
+atg <- which(fOBtop$genes %in% a)
+rhsl <- rownames(fOBtop[hsl,])
+ratg <- rownames(fOBtop[atg,])
+
+#Plot volcanoplot
+vp1 <- ggplot(vpfdf, aes(x=log10FC, y=log10FDR))
+vp1 <- vp1 + theme(plot.title = element_text(face="bold", colour="darkblue", size=10, hjust = 0.5), axis.title.x = element_text(face="bold", size = 8), axis.title.y = element_text(face="bold", size = 8), panel.background = element_rect(fill = "white"), panel.grid = element_blank()) 
+vp1 <- vp1 + ggtitle("DE for fOB vs fNO")
+vp1 <- vp1 + ylab("-log10FDR")
+vp1 <- vp1 + geom_point(size = 1, shape = 21, colour = "black", fill = "gray", stroke = 0.1)
+vp1 <- vp1 + geom_point(data = vpf.df12, size = 1, shape = 21, colour = "black", fill = "orange", stroke = 0.2)
+#vp1 <- vp1 + geom_point(data = vpf.df2, size = 1, shape = 21, colour = "black", fill = "green", stroke = 0.2)
+
+#Specific genes/points to highlight
+vp1 <- vp1 + geom_point(data = vpf.df12[rgif,],size =  vpf.df12[rgif,4], shape = 21, colour = "black", fill = "red", stroke = 0.4)
+#vp1 <- vp1 + geom_point(data = vpf.df[ratg,],size = 0.5*vpf.df[ratg,4], shape = 21, colour = "black", fill = "red", stroke = 0.4) #Highlighted points red
+#vp1 <- vp1 + geom_point(data = vpf.df[rhsl,],size = 0.5*vpf.df[rhsl,4], shape = 21, colour = "black", fill = "blue", stroke = 0.4) #Highlighted points blue
+
+vp1 <- vp1 + geom_hline(yintercept = 1.9,size =0.2, colour = "darkgrey") #Significance line
+vp1 <- vp1 + geom_vline(xintercept = -1, linetype = 'dashed')
+vp1 <- vp1 + geom_vline(xintercept = 1, linetype = 'dashed')
+vp1 <- vp1 + annotate(geom='text', size = 2.3, colour = "darkgrey", label = "FDR < 0.01", x = -5, y =2.3)
+vp1 <- vp1 + annotate(geom='text', size = 3,colour = "blue", label = "Up", x = 1.6, y =12) + annotate(geom='text', size = 3, colour = "red", label = "Down", x = -2, y =12)
+#Add gene-labels for highlighted points
+vp1 <- vp1 +  geom_label_repel(
+    data = vpf.df12[rgif,],
+    aes(label = genes),
+    size = 3, color = "black",
+    box.padding = unit(0.35, "lines"),
+    point.padding = unit(0.05, "lines")
+  ) 
+vp1 <- vp1 + xlim(-8,8) + ylim(0,15)
+vp1 <- vp1+border()
+vp1
+```
+
+
+####**Volcanoplot for hOB - hNO**
+In this chunk we construct df for use in volcano plot to visualise differentially expressed tag clusters, and highlight specific genes, with subjects in a hyperinsulinemic state.
+```{r}
+#Construct df for volcanoplot
+#Make df w all data, incl non-significant
+vphdf <- data.frame(log10FC = hTop1$table$logFC,
+                 log10FDR = -log10(hTop1$table$FDR),
+                 genes = hTop1$table$genes,
+                 lcpm = hTop1$table$logCPM)
+
+#Make df w only significant data (FDR < 0.01)
+vph.df <- data.frame(log10FC = hOBtop$logFC,
+                 log10FDR = -log10(hOBtop$FDR), 
+                 genes = hOBtop$genes,
+                 lcpm = hOBtop$logCPM)
+rownames(vph.df) <- rownames(hOBtop)
+
+#Make df w hOBdown w logFC < -1, hOBup w logFC > 1
+h.ix1 <- which(hOBtop$logFC < -1)
+hOBdown <- hOBtop[h.ix1,]
+rownames(hOBdown) <- rownames(hOBtop[h.ix1,])
+vph.df1 <- data.frame(log10FC = hOBdown$logFC,
+                 log10FDR = -log10(hOBdown$FDR),
+                 genes = hOBdown$genes,
+                 lcpm = hOBdown$logCPM)
+rownames(vph.df1) <- rownames(hOBdown)
+h.ix2 <- which(hOBtop$logFC > 1)
+hOBup <- hOBtop[h.ix2,]
+rownames(hOBup) <- rownames(hOBtop[h.ix2,])
+vph.df2 <- data.frame(log10FC = hOBup$logFC,
+                 log10FDR = -log10(hOBup$FDR),
+                 genes = hOBup$genes,
+                 lcpm = hOBup$logCPM)
+rownames(vph.df2) <- rownames(hOBup)
+#Make hOBup and hOBdown df into one
+vph.df12 <- rbind(vph.df1, vph.df2)
+
+#Pick out indices for rows/genes of interest
+#genes associated w mordbid obesity:
+gif <- c("PPARG","CEP19","GHR","IGF2R","LEP","LEPR","UCP2","LPL","FTO","ADIPOR1","ADIPOQ")
+#gif <- c("LPL")
+gif.ix <- which(vph.df12$genes %in% gif)
+rgif <- rownames(vph.df12[gif.ix,])
+
+#adiponectin-related genes:
+h <- c("ADIPOR1","ADIPOQ")
+hsl <- which(hOBtop$genes %in% h)
+rhsl <- rownames(hOBtop[hsl,])
+rhsl <- rhsl[-5]
+#lipolysis-related genes:
+a <- c("PLIN1","FABP4","LIPE")
+atg <- which(hOBtop$genes %in% a)
+gta <- which(hOBtop$logCPM>7)
+ratg <- rownames(hOBtop[atg,])
+ratg2 <- rownames(hOBtop[gta,])
+m.ix <- which(ratg2 %in% ratg)
+ratg <- ratg2[m.ix]
+
+
+#Plot volcanoplot
+vp2 <- ggplot(vphdf, aes(x=log10FC, y=log10FDR))
+vp2 <- vp2 + theme(plot.title = element_text(face="bold", colour="darkblue", size=10, hjust = 0.5), axis.title.x = element_text(face="bold", size = 8), axis.title.y = element_text(face="bold", size = 8), panel.background = element_rect(fill = "white"), panel.grid = element_blank())
+vp2 <- vp2 + ggtitle("DE for hOB vs hNO")
+vp2 <- vp2 + ylab("-log10FDR")
+vp2 <- vp2 + geom_point(size = 1, shape = 21, colour = "black", fill = "gray", stroke = 0.1)
+
+vp2 <- vp2 + geom_point(data = vph.df12,size = 1, shape = 21, colour = "black", fill = "orange", stroke = 0.2)
+
+#Highlight pecific genes/points
+vp2 <- vp2 + geom_point(data = vph.df12[rgif,],size = vph.df12[rgif,4], shape = 21, colour = "black", fill = "red", stroke = 0.4)
+#vp2 <- vp2 + geom_point(data = vph.df[rins,],size = 0.5*vph.df[rins,4], shape = 21, colour = "black", fill = "blue", stroke = 0.4)
+#vp2 <- vp2 + geom_point(data = vph.df[rhsl,],size = 0.5*vph.df[rhsl,4], shape = 21, colour = "black", fill = "blue", stroke = 0.4) #highlight lipolysis-genes
+#vp2 <- vp2 + geom_point(data = vph.df[ratg,],size = 0.5*vph.df[ratg,4], shape = 21, colour = "black", fill = "red", stroke = 0.4) #highlight adiponectin-genes
+vp2 <- vp2 + geom_hline(yintercept = 1.9,size =0.2, colour = "darkgrey")
+vp2 <- vp2 + geom_vline(xintercept = -1, linetype = 'dashed')
+vp2 <- vp2 + geom_vline(xintercept = 1, linetype = 'dashed')
+vp2 <- vp2 + annotate(geom='text',size = 2,colour = "darkgrey", label = "FDR < 0.01", x = -7, y =2.5)
+vp2 <- vp2 + annotate(geom='text',size = 3,colour = "blue", label = "Up", x = 1.6, y =14)
+vp2 <- vp2 + annotate(geom='text',size = 3,colour = "red", label = "Down", x = -2, y =14)
+#Add specific gene labels
+vp2 <- vp2 + geom_label_repel(
+    data = vph.df12[rgif,],
+    aes(label = genes),
+    size = 2, color = "black",
+    box.padding = unit(0.35, "lines"),
+    point.padding = unit(0.3, "lines")
+  ) 
+vp2 <- vp2 + ylim(0,15) + border()
+vp2
+```
+
+
+####**Boxplot of specific DE genes 1**
+This chunk makes a box plot that visualises specific differentially expressed genes between the subject groups during fasting
+```{r}
+#Construct groups for fasting comparison
+fNOGroup <- cohort.NO[cohort.NO$newcond == "NO.f0",]$newcond
+fS94Group <- S94.OB[S94.OB$newcond == "OB.f0",]$newcond
+fGroups <-  c(fNOGroup,fS94Group)
+
+#Pick out indices for rows/genes of interest
+a <- c("PLIN1","FABP4","LIPE")
+atg <- which(fOBtop$genes %in% a)
+ratg <- rownames(fOBtop[atg,])
+
+#Construct df for fasting comparison
+crle <- Counts_RLE$counts
+log2CPM2.f <- log2(cpm(crle[,c(NO.f0,S94.OBf)]))
+log2CPM2.f <- log2CPM2.f[ratg,]
+
+colnames(log2CPM2.f) <- fGroups
+rownames(log2CPM2.f) <- c("PLIN1.1","LIPE.1","PLIN1.2","PLIN1.3","PLIN1.4","LIPE.2","FABP4","PLIN1.5")
+fGenes <- as.vector(Counts_RLE$genes[ratg,])
+
+demA <- melt(log2CPM2.f, value.name = "log2cpm", varnames = c("Genes","Condition"))
+
+#Plot boxplot with chosen elements
+p <- ggplot(demA, aes(x = Genes, y = log2cpm, color = Condition)) + xlab("") + geom_boxplot()
+
+p + theme(axis.title.x = element_text(face="bold", colour="#990000", size=10),
+           axis.text.x  = element_text(face="bold",angle=90, vjust=0.5, size=6),
+          plot.title = element_text(face="bold", colour = "darkblue")) + ggtitle("Differential expression of\nspecific genes during fasting")
+```
+
+
+####**Boxplot of specific DE genes 2**
+This chunk makes a box plot that visualises specific differentially expressed genes between the subject groups during hyperinsulinemia
+```{r}
+#Construct groups for hi comparison
+hNOGroup <- cohort.NO[cohort.NO$newcond == "NO.h0",]$newcond
+hS94Group <- S94.OB[S94.OB$newcond == "OB.h0",]$newcond
+hGroups <-  c(hNOGroup,hS94Group)
+
+#Pick out indices for rows/genes of interest
+h <- c("ADIPOR1","ADIPOQ")
+hsl <- which(hOBtop$genes %in% h)
+rhsl <- rownames(hOBtop[hsl,])
+
+#Construct df for hyperinsulin comparison
+log2CPM2.h <- as.matrix(log2(cpm(crle[,c(NO.h0,S94.OBh)])))
+log2CPM2.h <- log2CPM2.h[rhsl,]
+colnames(log2CPM2.h) <- hGroups
+rownames(log2CPM2.h) <- Counts_RLE$genes[rhsl,]
+rownames(log2CPM2.h) <- c("ADIPOQ.1","ADIPOR1.1","ADIPOR1.2","ADIPOR1.3", "ADIPOQ.2")
+hGenes <- as.vector(Counts_RLE$genes[rhsl,])
+
+demL <- melt(log2CPM2.h, value.name = "log2cpm", varnames = c("Genes","Condition"))
+
+#Plot boxplot with chosen elements
+p <- ggplot(demL, aes(x = Genes, y = log2cpm, color = Condition)) + xlab("") + geom_boxplot()
+
+p + theme(axis.title.x = element_text(face="bold", colour="#990000", size=10),
+           axis.text.x  = element_text(face="bold",angle=90, vjust=0.5, size=6),
+          plot.title = element_text(face="bold", colour = "darkblue")) + ggtitle("Differential expression of specific \ngenes during hyperinsulinaemia")
+```
+
+
+
